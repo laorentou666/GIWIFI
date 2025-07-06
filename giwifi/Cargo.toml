@@ -1,0 +1,21 @@
+[package]
+name = "giwifi"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+anyhow = "1.0.97"
+tokio = { version = "1.44.2", features = ["full"] }
+clap = { version = "4.5.35", features = ["derive", "env"] }
+
+aes = "0.8.4"
+base64 = "0.22.1"
+cbc = { version = "0.1.2", features = ["std"] }
+
+url = "2.5.4"
+scraper = { version = "0.23.1" }
+reqwest = { version = "0.12.15", features = ["json"] }
+
+
+serde = { version = "1.0.129", features = ["derive"] }
+serde_urlencoded = "0.7.1"
