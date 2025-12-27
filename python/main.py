@@ -17,7 +17,7 @@ p = "xxxxxx"
 se = requests.session()
 se.headers.update(hd)
 
-WAN_DEVICE = "eth0"  # ← 改成你的实际网卡名（可能是 eth0, eth1, pppoe-wan 等）
+WAN_DEVICE = "eth0"  # ← 根据自己的网卡名称修改
 
 
 def get_wan_ip():
@@ -31,18 +31,15 @@ def get_wan_ip():
         )
         wan_info = json.loads(result.stdout)
         
-        # 检查是否有 IPv4 地址
         if 'ipv4-address' in wan_info and len(wan_info['ipv4-address']) > 0:
             return wan_info['ipv4-address'][0]['address']
         
-        # 如果没有，尝试从 ip addr 命令获取
         result = subprocess.run(
             ["ip", "-4", "addr", "show", WAN_DEVICE],
             capture_output=True,
             text=True,
             timeout=5
         )
-        # 解析输出，找到 inet 行
         for line in result.stdout.split('\n'):
             if 'inet ' in line:
                 ip = line.strip().split()[1].split('/')[0]
@@ -55,24 +52,17 @@ def get_wan_ip():
 
 
 def refresh_network():
-    """通过网卡 down/up 刷新网络（模拟重新插拔网线）"""
+    """通过网卡 down/up 刷新网络"""
     try:
         print("[网络] 重启网卡以刷新 ARP 缓存...")
-        
-        # down 网卡
         subprocess.run(['ip', 'link', 'set', WAN_DEVICE, 'down'], 
                       timeout=5, check=False)
-        time.sleep(2)
-        
-        # up 网卡
+        time.sleep(5)
         subprocess.run(['ip', 'link', 'set', WAN_DEVICE, 'up'], 
                       timeout=5, check=False)
-        
-        # 等待接口恢复
         print("[网络] 等待网卡恢复...")
-        time.sleep(5)
+        time.sleep(3.5)
         
-        # 检查 IP 是否恢复
         for i in range(10):
             ip = get_wan_ip()
             if ip:
@@ -82,46 +72,116 @@ def refresh_network():
         
         print("[网络] 警告：网卡未获取到 IP，继续尝试认证...")
         return False
-        
     except Exception as e:
         print(f"[网络] 刷新失败: {e}")
         return False
 
 
+def do_auth_request(wan_ip, u, p):
+    """
+    执行单次登录请求逻辑
+    返回: response 对象
+    """
+    try:
+        # 1. 获取登录页，拿到 token/iv 等信息
+        login_page_url = base + f"/gportal/web/login?wlanuserip={wan_ip}&wlanacname=GiWiFi_lnsfHG"
+        res = se.get(login_page_url)
+        doc = pq(res.text)
+        
+        # 2. 填充表单
+        doc("#loginForm input[name=user_account]").val(u)
+        doc("#loginForm input[name=user_password]").val(p)
+        
+        # 3. 加密数据
+        data = "&".join([
+            f"{el.attr('name')}={quote(el.val())}"
+            for el in doc("#loginForm input").items()
+        ])
+        
+        # 注意：这里假设 cryptoEncode 返回的是字典
+        iv_val = doc("input[name=iv]").attr("value")
+        if not iv_val:
+            # 有时候页面加载失败没有IV，直接返回原页面内容供上层判断
+            return res 
+            
+        msg = cryptoEncode(data, iv_val)
+        msg_str = "&".join([f"{k}={quote(v)}" for k, v in msg.items()])
+        
+        # 4. 发送 POST
+        post_res = se.post(base + "/gportal/Web/loginAction", data=msg_str)
+        return post_res
+        
+    except Exception as e:
+        print(f"[内部错误] 构造请求失败: {e}")
+        return None
+
+
 def login(u, p):
-    # 先刷新网络
+    # 1. 先执行物理层面的网络刷新（只做一次）
     refresh_network()
     
-    # 获取 WAN 口 IP
+    # 2. 获取 IP
     wan_ip = get_wan_ip()
     if not wan_ip:
         print("[错误] 无法获取 WAN IP，退出")
         return
     
-    print(f"[登录] 使用 IP: {wan_ip}")
+    print(f"[登录] 使用 IP: {wan_ip} 开始认证...")
     
+    # 3. 第一次尝试登录
+    res = do_auth_request(wan_ip, u, p)
+    if not res:
+        return
+
+    # 4. 解析结果，检查是否需要绑定
     try:
-        res = se.get(base + f"/gportal/web/login?wlanuserip={wan_ip}&wlanacname=GiWiFi_lnsfHG")
-        doc = pq(res.text)
-        doc("#loginForm input[name=user_account]").val(u)
-        doc("#loginForm input[name=user_password]").val(p)
-        data = "&".join([
-            f"{el.attr('name')}={quote(el.val())}"
-            for el in doc("#loginForm input").items()
-        ])
-        msg = cryptoEncode(data, doc("input[name=iv]").attr("value"))
-        msg = "&".join([f"{k}={quote(v)}" for k, v in msg.items()])
-        res = se.post(base + "/gportal/Web/loginAction", data=msg)
-        print(res.text)
+        # 尝试解析 JSON
+        res_json = res.json()
+        
+        # 检查是否命中“绑定设备”的逻辑 (Status 0 + ResultCode 124)
+        if res_json.get("status") == 0 and res_json.get("data", {}).get("resultCode") == 124:
+            info_msg = res_json.get('info', '需要验证设备')
+            print(f"[提示] {info_msg}")
+            
+            # 获取绑定链接
+            # 服务器返回的 resultData 类似于: /Giportal/index.php/Sta/bindSta?token=...
+            bind_path = res_json['data']['resultData']
+            full_bind_url = base + bind_path
+            
+            print(f"[绑定] 检测到新设备，正在请求绑定接口: {full_bind_url}")
+            
+            # 请求绑定接口
+            bind_res = se.get(full_bind_url)
+            print(f"[绑定] 服务器响应: {bind_res.text}")
+            
+            # 绑定后，通常需要再次发送登录包
+            print("[绑定] 绑定操作完成，正在自动重试登录...")
+            time.sleep(7) # 稍等7s让服务器同步状态
+            
+            # 5. 再次尝试登录 (Retry)
+            retry_res = do_auth_request(wan_ip, u, p)
+            if retry_res:
+                print(f"[最终结果] {retry_res.text}")
+                
+        else:
+            # 正常的成功或普通失败
+            print(f"[结果] {res.text}")
+            
+    except json.JSONDecodeError:
+        # 如果返回的不是 JSON（可能是 HTML 错误页或已经登录成功的页面）
+        print(f"[结果] 非JSON响应: {res.text}")
     except Exception as e:
-        print(f"[错误] 登录失败: {e}")
+        print(f"[异常] 处理响应时出错: {e}")
 
 
 def logout():
-    si = get_si()
-    data = {"si": si}
-    res = se.post(base + "/gportal/Web/logoutAction", data=data)
-    print(res.text)
+    try:
+        si = get_si()
+        data = {"si": si}
+        res = se.post(base + "/gportal/Web/logoutAction", data=data)
+        print(res.text)
+    except Exception as e:
+        print(f"[注销失败] {e}")
 
 
 def get_si():

@@ -4,7 +4,9 @@ forked from [mcitem/GIWIFI](https://github.com/mcitem/GIWIFI)
 
 对Python脚本做出一些修改 识别wan口的IP，并填入认证链接部分 增加网口热插拔功能
 
-By Claude4.5-sonnet
+20251225更新：支持自动绑定设备
+
+By Claude4.5-sonnet & Gemini3.0 Pro
 
 使用方法：
 
@@ -12,7 +14,7 @@ By Claude4.5-sonnet
 
 在Openwrt配置python环境
 
-把依赖打上，在机器内执行main.py login/logout即可（可能需要clone mac地址）
+把依赖打上，在机器内执行main.py login/logout即可
 
 附定时执行方法：
 
