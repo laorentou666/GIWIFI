@@ -6,6 +6,7 @@ import subprocess
 import json
 import sys
 import time
+import re
 
 base = "http://100.100.9.2"
 hd = {
@@ -14,6 +15,7 @@ hd = {
 }
 u = "xxxxx"
 p = "xxxxx"
+student_id = "xxxxx"  # ← 填学工号
 se = requests.session()
 se.headers.update(hd)
 
@@ -94,7 +96,7 @@ def do_auth_request(wan_ip, u, p):
         
         # 3. 加密数据
         data = "&".join([
-            f"{el.attr('name')}={quote(el.val())}"
+            f"{el.attr('name')}={quote(el.val() or '')}"
             for el in doc("#loginForm input").items()
         ])
         
@@ -116,7 +118,88 @@ def do_auth_request(wan_ip, u, p):
         return None
 
 
-def login(u, p):
+def complete_user_info(info_url, stu_id, u=None, p=None):
+    """
+    处理完善个人信息流程 (ResultCode 40)
+    1. 访问完善信息页获取 iv、页面预填的真实姓名 (identity_name) 及提交接口地址
+    2. 填入顶端配置的学工号 (identity_no)，AES 加密后 POST 提交
+    """
+    try:
+        full_info_url = info_url if info_url.startswith("http") else base + info_url
+        print(f"[信息完善] 正在访问个人信息页面: {full_info_url}")
+        res = se.get(full_info_url)
+        doc = pq(res.text)
+
+        # 提取加密 IV
+        iv_val = doc("#formData input[name=iv]").val() or doc("#iv").attr("value")
+        if not iv_val:
+            print("[错误] 无法从个人信息页面获取加密 IV")
+            return False
+
+        # 填充学工号（真实姓名 identity_name 由页面服务端预填，保留原值）
+        doc("#formData input[name=identity_no]").val(stu_id)
+
+        # 构造 #formData 序列化参数 (如: iv=xxx&identity_name=xxx&identity_no=xxx)
+        data = "&".join([
+            f"{el.attr('name')}={quote(el.val() or '')}"
+            for el in doc("#formData input").items()
+            if el.attr("name")
+        ])
+
+        # 从页面脚本中提取包含动态 rand 参数的提交路径
+        m = re.search(r'(/Giportal/index\.php/user/completeUserInfo\?rand=\d+)', res.text)
+        submit_path = m.group(1) if m else "/Giportal/index.php/user/completeUserInfo"
+        submit_url = base + submit_path
+
+        msg = cryptoEncode(data, iv_val)
+        msg_str = "&".join([f"{k}={quote(v)}" for k, v in msg.items()])
+
+        print(f"[信息完善] 正在提交学工号 ({stu_id}) 至: {submit_url}")
+        post_res = se.post(submit_url, data=msg_str)
+        print(f"[信息完善] 服务器响应: {post_res.text}")
+
+        res_json = post_res.json()
+        if res_json.get("status") == 1:
+            print(f"[信息完善] {res_json.get('info', '完善用户信息完成!')}")
+            return True
+
+        # 若返回 data == '1001'，表示当前学/工号已被其他账户绑定，附上原账号密码重新绑定
+        if str(res_json.get("data")) == "1001" and u and p:
+            print("[信息完善] 检测到当前学/工号已被其他账户绑定，正在尝试附带账号密码解绑并重绑...")
+            rebind_data = f"{data}&old_account={quote(u)}&old_password={quote(p)}"
+            rebind_msg = cryptoEncode(rebind_data, iv_val)
+            rebind_msg_str = "&".join([f"{k}={quote(v)}" for k, v in rebind_msg.items()])
+            rebind_res = se.post(submit_url, data=rebind_msg_str)
+            print(f"[信息完善] 重绑响应: {rebind_res.text}")
+            rebind_json = rebind_res.json()
+            if rebind_json.get("status") == 1:
+                return True
+
+        print(f"[错误] 完善个人信息失败: {res_json.get('info', '未知错误')}")
+        return False
+
+    except Exception as e:
+        print(f"[异常] 完善个人信息过程出错: {e}")
+        return False
+
+
+def bind_device(bind_path):
+    """
+    处理新设备绑定流程 (ResultCode 124)
+    注意：HAR 捕获显示前端通过 $.post(resultData, {}) 发起 POST 请求
+    """
+    try:
+        full_bind_url = bind_path if bind_path.startswith("http") else base + bind_path
+        print(f"[绑定] 检测到新设备，正在请求绑定接口: {full_bind_url}")
+        bind_res = se.post(full_bind_url, data={})
+        print(f"[绑定] 服务器响应: {bind_res.text}")
+        return True
+    except Exception as e:
+        print(f"[异常] 绑定设备出错: {e}")
+        return False
+
+
+def login(u, p, stu_id=student_id):
     # 1. 先执行物理层面的网络刷新（只做一次）
     refresh_network()
     
@@ -128,41 +211,43 @@ def login(u, p):
     
     print(f"[登录] 使用 IP: {wan_ip} 开始认证...")
     
-    # 3. 第一次尝试登录
+    # 3. 发起首次登录请求
     res = do_auth_request(wan_ip, u, p)
     if not res:
         return
 
-    # 4. 解析结果，检查是否需要绑定
     try:
-        # 尝试解析 JSON
         res_json = res.json()
-        
-        # 检查是否命中“绑定设备”的逻辑 (Status 0 + ResultCode 124)
-        if res_json.get("status") == 0 and res_json.get("data", {}).get("resultCode") == 124:
-            info_msg = res_json.get('info', '需要验证设备')
+
+        # 4. 检查是否命中“请先完善您的个人信息!” (Status 0 + ResultCode 40)
+        if res_json.get("status") == 0 and str(res_json.get("data", {}).get("resultCode")) == "40":
+            info_msg = res_json.get("info", "请先完善您的个人信息!")
+            print(f"[提示] {info_msg}")
+            info_url = res_json["data"]["resultData"]
+
+            if complete_user_info(info_url, stu_id, u, p):
+                print("[信息完善] 个人信息完善成功，等待 3 秒后重新发起登录认证...")
+                time.sleep(3)
+                res = do_auth_request(wan_ip, u, p)
+                if not res:
+                    return
+                res_json = res.json()
+            else:
+                return
+
+        # 5. 检查是否命中“绑定设备”的逻辑 (Status 0 + ResultCode 124)
+        if res_json.get("status") == 0 and str(res_json.get("data", {}).get("resultCode")) == "124":
+            info_msg = res_json.get("info", "需要验证设备")
             print(f"[提示] {info_msg}")
             
-            # 获取绑定链接
-            # 服务器返回的 resultData 类似于: /Giportal/index.php/Sta/bindSta?token=...
-            bind_path = res_json['data']['resultData']
-            full_bind_url = base + bind_path
-            
-            print(f"[绑定] 检测到新设备，正在请求绑定接口: {full_bind_url}")
-            
-            # 请求绑定接口
-            bind_res = se.get(full_bind_url)
-            print(f"[绑定] 服务器响应: {bind_res.text}")
-            
-            # 绑定后，通常需要再次发送登录包
-            print("[绑定] 绑定操作完成，正在自动重试登录...")
-            time.sleep(7) # 稍等两秒让服务器同步状态
-            
-            # 5. 再次尝试登录 (Retry)
-            retry_res = do_auth_request(wan_ip, u, p)
-            if retry_res:
-                print(f"[最终结果] {retry_res.text}")
+            bind_path = res_json["data"]["resultData"]
+            if bind_device(bind_path):
+                print("[绑定] 绑定操作完成，正在自动重试登录...")
+                time.sleep(5)
                 
+                retry_res = do_auth_request(wan_ip, u, p)
+                if retry_res:
+                    print(f"[最终结果] {retry_res.text}")
         else:
             # 正常的成功或普通失败
             print(f"[结果] {res.text}")
@@ -197,4 +282,4 @@ if __name__ == "__main__":
     if len(sys.argv) > 1 and sys.argv[1] == "logout":
         logout()
     else:
-        login(u, p)
+        login(u, p, student_id)
